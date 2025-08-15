@@ -69,8 +69,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        analysis_model = genai.GenerativeModel('gemini-2.5-pro')
-        category_model = genai.GenerativeModel('gemini-2.5-flash')
+        def _first_available(model_names):
+            for _name in model_names:
+                try:
+                    return genai.GenerativeModel(_name)
+                except Exception:
+                    continue
+            return None
+        analysis_model = _first_available(['gemini-2.5-pro', 'gemini-2.0-pro', 'gemini-1.5-pro', 'models/gemini-1.5-pro-latest', 'gemini-pro'])
+        category_model = _first_available(['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'models/gemini-1.5-flash-latest'])
+        if not analysis_model or not category_model:
+            logging.warning(f"Gemini model fallback in effect. Analysis model configured: {getattr(analysis_model, 'model_name', None)}, category model: {getattr(category_model, 'model_name', None)}")
     else:
         analysis_model = None
         category_model = None
@@ -277,11 +286,11 @@ class FollowUpModal(discord.ui.Modal, title="Ask a Follow-up Question"):
         previous_analysis = "\n".join([embed['description'] for embed in json.loads(embeds_json)])
         
         follow_up_response = await analyze_follow_up(raw_log, previous_analysis, self.question.value)
+        response_chunks = [follow_up_response[i:i + 2000] for i in range(0, len(follow_up_response), 2000)]
         
         # Post to original thread
         try:
             await thread.send(f"**Follow-up from {interaction.user.mention}:**\n> {self.question.value}")
-            response_chunks = [follow_up_response[i:i + 2000] for i in range(0, len(follow_up_response), 2000)]
             for chunk in response_chunks:
                 await thread.send(chunk)
             logging.info(f"Posted follow-up to thread {thread.id}")
@@ -400,7 +409,7 @@ class AnalysisPagination(discord.ui.View):
                     await db.execute("UPDATE analyses SET current_page = ? WHERE message_id = ?", (current_page, interaction.message.id))
                     await db.commit()
 
-    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.grey, disabled=True)
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.secondary, disabled=True)
     async def page_indicator(self, interaction: discord.Interaction, button: discord.ui.Button): pass
 
     @discord.ui.button(label="Ask a Follow-up", style=discord.ButtonStyle.primary, row=2)
@@ -469,12 +478,13 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
         embed_causes = discord.Embed(title="Potential Causes", color=discord.Color.orange())
         cause_chunks = await chunk_long_text(causes_text, 4096)
         embed_causes.description = cause_chunks[0]
+        embeds.append(embed_causes)
         if len(cause_chunks) > 1:
             for i, chunk in enumerate(cause_chunks[1:]):
-                embed_causes.add_field(name=f"Potential Causes (Cont. {i+1})", value=chunk, inline=False)
-        embeds.append(embed_causes)
+                cont_embed = discord.Embed(title=f"Potential Causes (Cont. {i+1})", description=chunk, color=discord.Color.orange())
+                embeds.append(cont_embed)
         
-        # --- Fixes Embeds (One per avenue) ---
+        # --- Fixes Embeds (One per avenue), chunked to respect Discord limits ---
         fix_avenues = fixes_text.split("~##~")
         if not fixes_text.strip() or not fix_avenues:
             embed_fixes = discord.Embed(title="Possible Fixes", description="No specific fixes were identified.", color=discord.Color.green())
@@ -482,9 +492,15 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
         else:
             for i, avenue in enumerate(fix_avenues):
                 avenue_content = avenue.strip()
-                if not avenue_content: continue
-                embed_fix = discord.Embed(title=f"Possible Fix (Avenue {i+1})", description=avenue_content, color=discord.Color.green())
-                embeds.append(embed_fix)
+                if not avenue_content:
+                    continue
+                avenue_chunks = await chunk_long_text(avenue_content, 4096)
+                first_fix_embed = discord.Embed(title=f"Possible Fix (Avenue {i+1})", description=avenue_chunks[0], color=discord.Color.green())
+                embeds.append(first_fix_embed)
+                if len(avenue_chunks) > 1:
+                    for j, chunk in enumerate(avenue_chunks[1:]):
+                        cont_fix_embed = discord.Embed(title=f"Possible Fix (Avenue {i+1} Cont. {j+1})", description=chunk, color=discord.Color.green())
+                        embeds.append(cont_fix_embed)
 
         # --- History Embed ---
         if history:
@@ -618,12 +634,12 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
                     post_title = f"{' '.join(categories)} - mclo.gs/{log_id}"
                     if len(post_title) > 100: post_title = post_title[:97] + "..."
                     
-                    forum_post_message, _ = await forum.create_thread(name=post_title, content=f"Analysis for `mclo.gs/{log_id}`")
-                    forum_post_id = forum_post_message.id
+                    forum_thread, starter_message = await forum.create_thread(name=post_title, content=f"Analysis for `mclo.gs/{log_id}`")
+                    forum_post_id = forum_thread.id
                     
                     for embed in embeds:
-                        await forum_post_message.send(embed=embed)
-                    await forum_post_message.send(view=ForumPostControls())
+                        await forum_thread.send(embed=embed)
+                    await forum_thread.send(view=ForumPostControls())
                     
                     logging.info(f"Created forum post {forum_post_id} for analysis.")
                 else:
@@ -846,9 +862,10 @@ async def on_ready():
     bot.add_view(AnalysisPagination())
     logging.info("Re-registered persistent views.")
 
-    await bot.add_cog(LogAnalyzer(bot))
-    await bot.add_cog(AdminSlashCommands(bot))
-    update_presence.start(bot)
+    bot.add_cog(LogAnalyzer(bot))
+    bot.add_cog(AdminSlashCommands(bot))
+    if not update_presence.is_running():
+        update_presence.start(bot)
 
     try:
         synced = await bot.tree.sync()
