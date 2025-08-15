@@ -9,6 +9,7 @@ import json
 import sys
 import time
 import asyncio
+import redis.asyncio as redis
 from discord.ext import commands, tasks
 from discord import app_commands
 
@@ -24,6 +25,10 @@ def load_config():
         template_config = {
             "DISCORD_BOT_TOKEN": "YOUR_DISCORD_TOKEN_HERE",
             "GEMINI_API_KEY": "YOUR_GEMINI_API_KEY_HERE",
+            "REDIS_HOST": "localhost",
+            "REDIS_PORT": 6379,
+            "REDIS_PASSWORD": None,
+            "REDIS_SSL": False,
             "guilds": {},
             "default_categories": [
                 "[World Generation]", "[Player Data]", "[KubeJS Scripting]", 
@@ -34,7 +39,7 @@ def load_config():
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(template_config, f, indent=4)
-        logging.error("Please fill in your tokens in bot_config.json and restart the bot.")
+        logging.error("Please fill in your tokens and Redis details in bot_config.json and restart the bot.")
         sys.exit(1)
     with open(CONFIG_FILE, 'r') as f:
         config = json.load(f)
@@ -54,6 +59,11 @@ DISCORD_BOT_TOKEN = config.get("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = config.get("GEMINI_API_KEY")
 FORUM_CHANNEL_ID = config.get("forum_channel_id")
 AUTO_ANALYSIS_CHANNEL_ID = config.get("auto_analysis_channel_id")
+REDIS_HOST = config.get("REDIS_HOST", "localhost")
+REDIS_PORT = config.get("REDIS_PORT", 6379)
+REDIS_PASSWORD = config.get("REDIS_PASSWORD", None)
+REDIS_SSL = config.get("REDIS_SSL", False)
+
 
 def get_expert_roles(guild_id: int) -> list[int]:
     return config.get("guilds", {}).get(str(guild_id), {}).get('expert_roles', [])
@@ -426,7 +436,6 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
     def __init__(self, bot):
         self.bot = bot
         self.session = aiohttp.ClientSession()
-        self.last_auto_analysis_time = 0
 
     def cog_unload(self):
         self.bot.loop.create_task(self.session.close())
@@ -539,6 +548,7 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
             logging.info(f"Skipped log {log_id} as it was not a crash report.")
             return
 
+        # --- Sequential Analysis ---
         start_time = time.time()
         await update_status(f"{thinking_emoji} Categorizing crash...")
         
@@ -645,30 +655,36 @@ class LogAnalyzer(commands.Cog, name="Log Analyzer"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild: return
+        if not message.guild: return
         
         # --- Auto-analysis Channel Logic ---
         if message.channel.id == AUTO_ANALYSIS_CHANNEL_ID:
-            if time.time() - self.last_auto_analysis_time < 300: # 5 minute cooldown
-                return
+            if message.author.id == 960032766047694848: # Specifically allow the crash reporter bot
+                if time.time() - self.last_auto_analysis_time < 300: # 5 minute cooldown
+                    logging.info("Auto-analysis rate limit triggered.")
+                    return
 
-            log_id = None
-            if message.embeds:
-                for embed in message.embeds:
-                    log_id = self.get_mclogs_id_from_embed(embed)
-                    if log_id: break
-            
-            if log_id:
-                self.last_auto_analysis_time = time.time()
-                logging.info(f"Auto-detected log {log_id} in channel {message.channel.id}.")
-                try:
-                    thread = await message.create_thread(name=f"Analysis for {log_id}")
-                    await self.start_analysis_pipeline(thread, message.id, log_id, message.author)
-                except Exception as e:
-                    logging.error(f"Failed to start auto-analysis pipeline: {e}")
-            return # End processing for this channel
+                log_id = None
+                if message.embeds:
+                    for embed in message.embeds:
+                        log_id = self.get_mclogs_id_from_embed(embed)
+                        if log_id: break
+                
+                if log_id:
+                    self.last_auto_analysis_time = time.time()
+                    logging.info(f"Auto-detected log {log_id} in channel {message.channel.id} from bot {message.author.id}.")
+                    try:
+                        thread = await message.create_thread(name=f"Analysis for {log_id}")
+                        await self.start_analysis_pipeline(thread, message.id, log_id, message.author)
+                    except Exception as e:
+                        logging.error(f"Failed to start auto-analysis pipeline: {e}")
+                return # End processing for this channel
+            else:
+                return # Ignore other messages/bots in this channel
 
-        # --- Expert Role Confirmation Logic ---
+        # --- Expert Role Confirmation Logic (for other channels) ---
+        if message.author.bot: return # Ignore all other bots
+
         expert_role_ids = get_expert_roles(message.guild.id)
         if not expert_role_ids: return
         author_role_ids = {role.id for role in message.author.roles}
