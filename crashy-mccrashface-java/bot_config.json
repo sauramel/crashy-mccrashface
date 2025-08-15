@@ -1,0 +1,15 @@
+{
+  "DISCORD_BOT_TOKEN": "dummy_discord_token",
+  "GEMINI_API_KEY": "dummy_gemini_key",
+  "guilds": {},
+  "default_categories": [
+    "[World Generation]",
+    "[Player Data]",
+    "[KubeJS Scripting]",
+    "[Mod Conflict]",
+    "[Performance/Tick Lag]",
+    "[Unknown]"
+  ],
+  "forum_channel_id": 1405938109845082265,
+  "auto_analysis_channel_id": 1196656884413906984
+}
